@@ -8,6 +8,7 @@ import ch.loway.oss.ari4java.generated.ari_0_0_1.actions.ActionBridges_impl_ari_
 import ch.loway.oss.ari4java.generated.ari_0_0_1.models.Bridge_impl_ari_0_0_1;
 import ch.loway.oss.ari4java.generated.ari_1_0_0.actions.*;
 import ch.loway.oss.ari4java.generated.models.Bridge;
+import ch.loway.oss.ari4java.generated.models.ChannelToneDetected;
 import ch.loway.oss.ari4java.generated.models.Mailbox;
 import ch.loway.oss.ari4java.tools.*;
 import ch.loway.oss.ari4java.tools.http.NettyHttpClient;
@@ -110,6 +111,23 @@ public class ARITest {
     }
 
     @Test
+    public void testOraAriTenBindingsRemainResolvable() throws Exception {
+        ARI ari = new ARI();
+        ari.setVersion(AriVersion.ARI_10_0_0);
+        ari.setHttpClient(mock(HttpClient.class));
+        ari.setWsClient(mock(WsClient.class));
+
+        assertEquals(
+                "ch.loway.oss.ari4java.generated.ari_10_0_0.actions.ActionEvents_impl_ari_10_0_0",
+                ari.events().getClass().getName()
+        );
+        assertEquals(
+                "ch.loway.oss.ari4java.generated.ari_10_0_0.models.ChannelToneDetected_impl_ari_10_0_0",
+                ari.getModelImpl(ChannelToneDetected.class).getClass().getName()
+        );
+    }
+
+    @Test
     public void testCreateUid() {
         String v = ARI.getUID();
         assertTrue(v.length() > 0, "UID created");
@@ -120,6 +138,44 @@ public class ARITest {
     public void testBuildVersion() {
         String v = new ARI().getBuildVersion();
         assertNotNull(v, "Build Version cannot be null");
+    }
+
+    @Test
+    public void testDestroyReleasesClientsWithoutAriUnsubscribeRequest() {
+        ARI ari = new ARI();
+        HttpClient httpClient = mock(HttpClient.class);
+        WsClient wsClient = mock(WsClient.class);
+        ari.setHttpClient(httpClient);
+        ari.setWsClient(wsClient);
+
+        ari.destroy();
+
+        verify(wsClient).destroy();
+        verify(httpClient).destroy();
+        verifyNoMoreInteractions(httpClient, wsClient);
+    }
+
+    @Test
+    public void testConfigureWebSocketReconnectLimit() {
+        ARI ari = new ARI();
+        WsClient reconnectingClient = mock(WsClient.class,
+                withSettings().extraInterfaces(WsClientAutoReconnect.class));
+        ari.setWsClient(reconnectingClient);
+
+        ari.setWsMaxReconnectCount(-1);
+
+        verify((WsClientAutoReconnect) reconnectingClient).setMaxReconnectCount(-1);
+    }
+
+    @Test
+    public void testConfigureWebSocketReconnectLimitRejectsUnsupportedClient() {
+        ARI ari = new ARI();
+        ari.setWsClient(mock(WsClient.class));
+
+        ARIRuntimeException error = assertThrows(ARIRuntimeException.class,
+                () -> ari.setWsMaxReconnectCount(-1));
+
+        assertEquals("WebSocket client does not support automatic reconnect", error.getMessage());
     }
 
     @Test

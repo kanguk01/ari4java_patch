@@ -10,7 +10,8 @@ import io.netty.buffer.Unpooled;
 import io.netty.channel.*;
 import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.handler.codec.http.*;
-import io.netty.handler.codec.http.websocketx.WebSocketVersion;
+import io.netty.handler.codec.http.websocketx.PingWebSocketFrame;
+import io.netty.handler.codec.http.websocketx.WebSocketFrame;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -20,7 +21,11 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
@@ -110,45 +115,360 @@ public class NettyHttpClientTest {
 
     @Test
     public void testWsConnect() throws Exception {
-        Bootstrap bootstrap = mock(Bootstrap.class);
-        NettyWSClientHandler testHandler = mock(NettyWSClientHandler.class);
-        EmbeddedChannel channel = createTestChannel("ws-handler", testHandler);
+        LifecycleTestClient testClient = new LifecycleTestClient();
+        client = testClient;
+        HttpResponseHandler callback = healthyCallback();
 
-        FullHttpRequest req = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/events");
-        HttpHeaders headers = req.headers();
-        headers.set(HttpHeaderNames.UPGRADE, HttpHeaderValues.WEBSOCKET);
-        headers.set(HttpHeaderNames.SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==");
-        headers.set(HttpHeaderNames.SEC_WEBSOCKET_VERSION, WebSocketVersion.V13);
-        cf = channel.closeFuture();
-        when(bootstrap.connect(eq("localhost"), eq(443))).thenReturn(cf);
-        ((DefaultChannelPromise) cf).setSuccess(null);
-
-        class TestNettyHttpClient extends NettyHttpClient {
-            @Override
-            public WsClientConnection connect(final HttpResponseHandler callback, final String url,
-                                              final List<HttpParam> lParamQuery) throws RestException {
-                try {
-                    baseUri = new URI("https://localhost/");
-                    this.auth = "123";
-                    getWsHandshake(url, lParamQuery); // here so the code is run for code coverage
-                } catch (URISyntaxException e) {
-                    // oh well
-                }
-                pingPeriod = 1;
-                pingTimeUnit = TimeUnit.SECONDS;
-                return connect(bootstrap, callback);
-            }
-//            public void testWsFutureOperationComplete(ChannelFuture future) throws Exception {
-//                this.wsHandler = testHandler;
-//                wsFuture.operationComplete(future);
-//            }
-        }
-        TestNettyHttpClient client = new TestNettyHttpClient();
-        WsClient.WsClientConnection connection = client.connect(mock(HttpResponseHandler.class), "/events", null);
+        WsClient.WsClientConnection connection = testClient.connect(callback, "/events", null);
         assertNotNull(connection, "Expected WsClientConnection");
-        channel.writeInbound(req);
-        Thread.sleep(10000);
-        client.destroy();
+        assertEquals(1, testClient.attempts.size());
+
+        testClient.attempts.get(0).succeed();
+
+        awaitCondition(testClient::isWsConnected);
+        verify(callback, times(1)).onChReadyToWrite();
+    }
+
+    @Test
+    public void staleHeartbeatMustNotReconnectReplacementConnection() throws Exception {
+        LifecycleTestClient testClient = new LifecycleTestClient();
+        client = testClient;
+        testClient.pingPeriod = 500;
+        testClient.pingTimeUnit = TimeUnit.MILLISECONDS;
+        testClient.pingIdleThresholdMillis = 0L;
+        testClient.pongTimeout = 80L;
+        testClient.pongTimeoutTimeUnit = TimeUnit.MILLISECONDS;
+        testClient.reconnectDelays = new long[]{0L};
+        testClient.reconnectDelayTimeUnit = TimeUnit.MILLISECONDS;
+
+        HttpResponseHandler callback = mock(HttpResponseHandler.class);
+        when(callback.getLastResponseTime()).thenReturn(0L);
+        testClient.connect(callback, "/events", null);
+        LifecycleTestClient.Attempt firstAttempt = testClient.attempts.get(0);
+        firstAttempt.succeed();
+        awaitCondition(testClient::isWsConnected);
+        awaitPing(firstAttempt);
+
+        long firstGeneration = testClient.currentWsGeneration();
+        testClient.reconnectWs(new RestException("WS channel inactive"), firstGeneration);
+        awaitCondition(() -> testClient.attempts.size() == 2);
+
+        LifecycleTestClient.Attempt replacementAttempt = testClient.attempts.get(1);
+        replacementAttempt.succeed();
+        awaitCondition(testClient::isWsConnected);
+        awaitPing(replacementAttempt);
+        testClient.pong(testClient.currentWsGeneration());
+
+        Thread.sleep(150L);
+        assertEquals(2, testClient.attempts.size(),
+                "A heartbeat owned by the previous connection must not reconnect the replacement connection");
+        verify(callback, times(2)).onChReadyToWrite();
+    }
+
+    @Test
+    public void noPongReconnectsCurrentConnectionOnce() throws Exception {
+        LifecycleTestClient testClient = new LifecycleTestClient();
+        client = testClient;
+        testClient.pingPeriod = 500;
+        testClient.pingTimeUnit = TimeUnit.MILLISECONDS;
+        testClient.pingIdleThresholdMillis = 0L;
+        testClient.pongTimeout = 30L;
+        testClient.pongTimeoutTimeUnit = TimeUnit.MILLISECONDS;
+        testClient.reconnectDelays = new long[]{0L};
+        testClient.reconnectDelayTimeUnit = TimeUnit.MILLISECONDS;
+
+        HttpResponseHandler callback = mock(HttpResponseHandler.class);
+        when(callback.getLastResponseTime()).thenReturn(0L);
+        testClient.connect(callback, "/events", null);
+        LifecycleTestClient.Attempt firstAttempt = testClient.attempts.get(0);
+        firstAttempt.succeed();
+        awaitPing(firstAttempt);
+
+        awaitCondition(() -> testClient.attempts.size() == 2);
+        assertEquals(2, testClient.attempts.size());
+        verify(callback, times(1)).onDisconnect();
+    }
+
+    @Test
+    public void overlappingReconnectSignalsScheduleOneReplacement() throws Exception {
+        LifecycleTestClient testClient = new LifecycleTestClient();
+        client = testClient;
+        testClient.reconnectDelays = new long[]{40L};
+        testClient.reconnectDelayTimeUnit = TimeUnit.MILLISECONDS;
+
+        HttpResponseHandler callback = healthyCallback();
+        testClient.connect(callback, "/events", null);
+        testClient.attempts.get(0).succeed();
+        awaitCondition(testClient::isWsConnected);
+        long generation = testClient.currentWsGeneration();
+
+        testClient.reconnectWs(new RestException("WS channel inactive"), generation);
+        testClient.reconnectWs(new RestException("No Ping response from server"), generation);
+        testClient.reconnectWs(new RestException("CloseWebSocketFrame received"), generation);
+
+        awaitCondition(() -> testClient.attempts.size() == 2);
+        Thread.sleep(80L);
+        assertEquals(2, testClient.attempts.size());
+        verify(callback, times(1)).onDisconnect();
+    }
+
+    @Test
+    public void disconnectCallbackFailureDoesNotBlockReconnect() throws Exception {
+        LifecycleTestClient testClient = new LifecycleTestClient();
+        client = testClient;
+        testClient.reconnectDelays = new long[]{0L};
+        testClient.reconnectDelayTimeUnit = TimeUnit.MILLISECONDS;
+        HttpResponseHandler callback = healthyCallback();
+        org.mockito.Mockito.doThrow(new IllegalStateException("listener failed"))
+                .when(callback).onDisconnect();
+        testClient.connect(callback, "/events", null);
+        testClient.attempts.get(0).succeed();
+        awaitCondition(testClient::isWsConnected);
+
+        testClient.reconnectWs(
+                new RestException("WS channel inactive"), testClient.currentWsGeneration());
+
+        awaitCondition(() -> testClient.attempts.size() == 2);
+        verify(callback, times(1)).onDisconnect();
+        verify(callback, never()).onFailure(any(Throwable.class));
+    }
+
+    @Test
+    public void terminalReconnectFailureCallsBackOnce() throws Exception {
+        LifecycleTestClient testClient = new LifecycleTestClient();
+        client = testClient;
+        testClient.setMaxReconnectCount(0);
+        HttpResponseHandler callback = healthyCallback();
+        testClient.connect(callback, "/events", null);
+        testClient.attempts.get(0).succeed();
+        awaitCondition(testClient::isWsConnected);
+        long generation = testClient.currentWsGeneration();
+
+        RestException terminal = new RestException("terminal");
+        testClient.reconnectWs(terminal, generation);
+        testClient.reconnectWs(terminal, generation);
+
+        awaitCondition(() -> !testClient.isWsConnected());
+        verify(callback, times(1)).onFailure(terminal);
+        assertEquals(1, testClient.attempts.size());
+    }
+
+    @Test
+    public void failedReconnectAttemptsStopAtConfiguredLimit() throws Exception {
+        LifecycleTestClient testClient = new LifecycleTestClient();
+        client = testClient;
+        testClient.setMaxReconnectCount(1);
+        testClient.reconnectDelays = new long[]{0L};
+        testClient.reconnectDelayTimeUnit = TimeUnit.MILLISECONDS;
+        HttpResponseHandler callback = healthyCallback();
+        testClient.connect(callback, "/events", null);
+
+        RuntimeException firstFailure = new RuntimeException("first transport failure");
+        testClient.attempts.get(0).failTransport(firstFailure);
+        awaitCondition(() -> testClient.attempts.size() == 2);
+
+        RuntimeException terminalFailure = new RuntimeException("replacement transport failure");
+        testClient.attempts.get(1).failTransport(terminalFailure);
+
+        awaitCondition(() -> !testClient.isWsConnected());
+        verify(callback, times(1)).onFailure(terminalFailure);
+        assertEquals(2, testClient.attempts.size());
+    }
+
+    @Test
+    public void reconnectLimitRejectsValuesBelowInfiniteSentinel() throws Exception {
+        LifecycleTestClient testClient = new LifecycleTestClient();
+        client = testClient;
+
+        IllegalArgumentException error = assertThrows(IllegalArgumentException.class,
+                () -> testClient.setMaxReconnectCount(-2));
+
+        assertEquals("Reconnect count must be -1 or greater", error.getMessage());
+    }
+
+    @Test
+    public void transportFailureRetriesWithoutPrematureFailureCallback() throws Exception {
+        LifecycleTestClient testClient = new LifecycleTestClient();
+        client = testClient;
+        testClient.reconnectDelays = new long[]{0L};
+        testClient.reconnectDelayTimeUnit = TimeUnit.MILLISECONDS;
+        HttpResponseHandler callback = healthyCallback();
+        testClient.connect(callback, "/events", null);
+
+        testClient.attempts.get(0).failTransport(new RuntimeException("connect failed"));
+
+        awaitCondition(() -> testClient.attempts.size() == 2);
+        verify(callback, never()).onFailure(any(Throwable.class));
+    }
+
+    @Test
+    public void handshakeFailureRetriesWithoutPrematureFailureCallback() throws Exception {
+        LifecycleTestClient testClient = new LifecycleTestClient();
+        client = testClient;
+        testClient.reconnectDelays = new long[]{0L};
+        testClient.reconnectDelayTimeUnit = TimeUnit.MILLISECONDS;
+        HttpResponseHandler callback = healthyCallback();
+        testClient.connect(callback, "/events", null);
+        LifecycleTestClient.Attempt firstAttempt = testClient.attempts.get(0);
+
+        firstAttempt.succeedTransport();
+        firstAttempt.failHandshake(new RuntimeException("upgrade failed"));
+
+        awaitCondition(() -> testClient.attempts.size() == 2);
+        verify(callback, never()).onFailure(any(Throwable.class));
+    }
+
+    @Test
+    public void connectionTimeoutRetriesOnlyTheTimedOutGeneration() throws Exception {
+        LifecycleTestClient testClient = new LifecycleTestClient();
+        client = testClient;
+        testClient.connectionTimeout = 30L;
+        testClient.connectionTimeoutTimeUnit = TimeUnit.MILLISECONDS;
+        testClient.reconnectDelays = new long[]{0L};
+        testClient.reconnectDelayTimeUnit = TimeUnit.MILLISECONDS;
+        HttpResponseHandler callback = healthyCallback();
+
+        testClient.connect(callback, "/events", null);
+
+        awaitCondition(() -> testClient.attempts.size() == 2);
+        LifecycleTestClient.Attempt replacementAttempt = testClient.attempts.get(1);
+        replacementAttempt.succeed();
+        awaitCondition(testClient::isWsConnected);
+        Thread.sleep(60L);
+        assertEquals(2, testClient.attempts.size());
+        verify(callback, never()).onFailure(any(Throwable.class));
+    }
+
+    @Test
+    public void successfulReconnectResetsRetryBudget() throws Exception {
+        LifecycleTestClient testClient = new LifecycleTestClient();
+        client = testClient;
+        testClient.setMaxReconnectCount(1);
+        testClient.reconnectDelays = new long[]{0L};
+        testClient.reconnectDelayTimeUnit = TimeUnit.MILLISECONDS;
+        HttpResponseHandler callback = healthyCallback();
+        testClient.connect(callback, "/events", null);
+
+        testClient.attempts.get(0).failTransport(new RuntimeException("first outage"));
+        awaitCondition(() -> testClient.attempts.size() == 2);
+        testClient.attempts.get(1).succeed();
+        awaitCondition(testClient::isWsConnected);
+
+        long recoveredGeneration = testClient.currentWsGeneration();
+        testClient.reconnectWs(new RestException("second outage"), recoveredGeneration);
+
+        awaitCondition(() -> testClient.attempts.size() == 3);
+        verify(callback, never()).onFailure(any(Throwable.class));
+    }
+
+    @Test
+    public void intentionalDisconnectCancelsReconnectAndHeartbeatTasks() throws Exception {
+        LifecycleTestClient testClient = new LifecycleTestClient();
+        client = testClient;
+        HttpResponseHandler callback = healthyCallback();
+        WsClient.WsClientConnection connection = testClient.connect(callback, "/events", null);
+        testClient.attempts.get(0).succeed();
+        awaitCondition(testClient::isWsConnected);
+
+        connection.disconnect();
+
+        awaitCondition(() -> !testClient.isWsConnected());
+        Thread.sleep(60L);
+        assertEquals(1, testClient.attempts.size());
+        verify(callback, never()).onFailure(any(Throwable.class));
+    }
+
+    private HttpResponseHandler healthyCallback() {
+        HttpResponseHandler callback = mock(HttpResponseHandler.class);
+        when(callback.getLastResponseTime()).thenAnswer(invocation -> System.currentTimeMillis());
+        return callback;
+    }
+
+    private void awaitPing(LifecycleTestClient.Attempt attempt) throws Exception {
+        awaitCondition(() -> attempt.pingCount.get() > 0);
+        assertEquals(PingWebSocketFrame.class, attempt.lastPingType.get());
+    }
+
+    private void awaitCondition(BooleanSupplier condition) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2L);
+        while (!condition.getAsBoolean() && System.nanoTime() < deadline) {
+            Thread.sleep(5L);
+        }
+        assertTrue(condition.getAsBoolean(), "Condition was not met before timeout");
+    }
+
+    private static final class LifecycleTestClient extends NettyHttpClient {
+        private final List<Attempt> attempts = new CopyOnWriteArrayList<>();
+
+        private LifecycleTestClient() throws URISyntaxException {
+            initialize("http://localhost:8088/", "user", "password");
+        }
+
+        @Override
+        protected void initHttpBootstrap() {
+            // HTTP is not used by WebSocket lifecycle tests.
+        }
+
+        @Override
+        protected WsClientConnection connect(Bootstrap ignored, HttpResponseHandler callback) {
+            Attempt attempt = new Attempt();
+            attempts.add(attempt);
+            ChannelHandlerContext handlerContext = mock(ChannelHandlerContext.class);
+            when(handlerContext.newPromise()).thenReturn(attempt.handshakePromise);
+            try {
+                wsHandler.handlerAdded(handlerContext);
+            } catch (Exception e) {
+                throw new IllegalStateException("Could not initialize WebSocket handler", e);
+            }
+
+            Bootstrap bootstrap = mock(Bootstrap.class);
+            when(bootstrap.connect(anyString(), anyInt())).thenReturn(attempt.transportPromise);
+            return super.connect(bootstrap, callback);
+        }
+
+        @Override
+        protected ChannelFuture writePing(Channel channel, WebSocketFrame frame) {
+            for (Attempt attempt : attempts) {
+                if (attempt.channel == channel) {
+                    attempt.lastPingType.set(frame.getClass());
+                    attempt.pingCount.incrementAndGet();
+                    frame.release();
+                    DefaultChannelPromise writePromise = new DefaultChannelPromise(channel);
+                    writePromise.trySuccess();
+                    return writePromise;
+                }
+            }
+            throw new IllegalStateException("No WebSocket attempt owns the ping channel");
+        }
+
+        private static final class Attempt {
+            private final EmbeddedChannel channel = new EmbeddedChannel();
+            private final DefaultChannelPromise transportPromise = new DefaultChannelPromise(channel);
+            private final DefaultChannelPromise handshakePromise = new DefaultChannelPromise(channel);
+            private final AtomicInteger pingCount = new AtomicInteger();
+            private final AtomicReference<Class<?>> lastPingType = new AtomicReference<>();
+
+            private void succeed() {
+                succeedTransport();
+                handshakePromise.trySuccess();
+                channel.runPendingTasks();
+            }
+
+            private void succeedTransport() {
+                transportPromise.trySuccess();
+                channel.runPendingTasks();
+            }
+
+            private void failTransport(Throwable cause) {
+                transportPromise.tryFailure(cause);
+                channel.runPendingTasks();
+            }
+
+            private void failHandshake(Throwable cause) {
+                handshakePromise.tryFailure(cause);
+                channel.runPendingTasks();
+            }
+        }
     }
 
     private void setupSync(NettyHttpClientHandler h) {
