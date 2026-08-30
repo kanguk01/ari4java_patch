@@ -186,6 +186,7 @@ public class NettyHttpClientTest {
 
         awaitCondition(() -> testClient.attempts.size() == 2);
         assertEquals(2, testClient.attempts.size());
+        verify(callback, times(1)).onDisconnect();
     }
 
     @Test
@@ -208,6 +209,28 @@ public class NettyHttpClientTest {
         awaitCondition(() -> testClient.attempts.size() == 2);
         Thread.sleep(80L);
         assertEquals(2, testClient.attempts.size());
+        verify(callback, times(1)).onDisconnect();
+    }
+
+    @Test
+    public void disconnectCallbackFailureDoesNotBlockReconnect() throws Exception {
+        LifecycleTestClient testClient = new LifecycleTestClient();
+        client = testClient;
+        testClient.reconnectDelays = new long[]{0L};
+        testClient.reconnectDelayTimeUnit = TimeUnit.MILLISECONDS;
+        HttpResponseHandler callback = healthyCallback();
+        org.mockito.Mockito.doThrow(new IllegalStateException("listener failed"))
+                .when(callback).onDisconnect();
+        testClient.connect(callback, "/events", null);
+        testClient.attempts.get(0).succeed();
+        awaitCondition(testClient::isWsConnected);
+
+        testClient.reconnectWs(
+                new RestException("WS channel inactive"), testClient.currentWsGeneration());
+
+        awaitCondition(() -> testClient.attempts.size() == 2);
+        verify(callback, times(1)).onDisconnect();
+        verify(callback, never()).onFailure(any(Throwable.class));
     }
 
     @Test

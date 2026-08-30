@@ -11,4 +11,6 @@ interface NettyWsConnectionLifecycle extends WsClientAutoReconnect {
     void reconnectWs(Throwable cause, long connectionGeneration);
 
     void pong(long connectionGeneration);
+
+    void disconnected(long connectionGeneration);
 }

@@ -29,7 +29,8 @@ class NettyWSClientHandlerTest {
 
         verify(lifecycle, times(1)).reconnectWs(failure, 7L);
         verify(callback, never()).onFailure(failure);
-        verify(callback, times(1)).onDisconnect();
+        verify(lifecycle, times(1)).disconnected(7L);
+        verify(callback, never()).onDisconnect();
         assertFalse(channel.isOpen());
         channel.finishAndReleaseAll();
     }
@@ -48,7 +49,8 @@ class NettyWSClientHandlerTest {
         verify(lifecycle, times(1)).reconnectWs(
                 org.mockito.ArgumentMatchers.any(Throwable.class),
                 org.mockito.ArgumentMatchers.eq(11L));
-        verify(callback, times(1)).onDisconnect();
+        verify(lifecycle, times(1)).disconnected(11L);
+        verify(callback, never()).onDisconnect();
         channel.finishAndReleaseAll();
     }
 

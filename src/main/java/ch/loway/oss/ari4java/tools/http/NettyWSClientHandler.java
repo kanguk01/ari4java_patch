@@ -73,11 +73,8 @@ public class NettyWSClientHandler extends NettyHttpClientHandler {
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
         if (!shuttingDown && this.wsClient != null) {
             logger.debug("WS channel inactive: generation={}, context={}", connectionGeneration, ctx);
-            try {
-                wsCallback.onDisconnect();
-            } finally {
-                requestReconnect(new RestException("WS channel inactive"));
-            }
+            notifyDisconnected();
+            requestReconnect(new RestException("WS channel inactive"));
         }
     }
 
@@ -170,6 +167,14 @@ public class NettyWSClientHandler extends NettyHttpClientHandler {
             return;
         }
         wsClient.pong();
+    }
+
+    private void notifyDisconnected() {
+        if (wsClient instanceof NettyWsConnectionLifecycle && connectionGeneration != UNTRACKED_CONNECTION) {
+            ((NettyWsConnectionLifecycle) wsClient).disconnected(connectionGeneration);
+            return;
+        }
+        wsCallback.onDisconnect();
     }
 
     public boolean isShuttingDown() {

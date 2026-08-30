@@ -26,6 +26,7 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -97,6 +98,7 @@ public class NettyHttpClient implements HttpClient, WsClient, WsClientAutoReconn
         private volatile ScheduledFuture<?> reconnectTask;
         private volatile long lastPongAt;
         private volatile boolean handshakeComplete;
+        private final AtomicBoolean disconnectNotified = new AtomicBoolean(false);
         private boolean terminalFailureNotified;
 
         private WsConnectionContext(long generation, NettyWSClientHandler handler) {
@@ -602,6 +604,8 @@ public class NettyHttpClient implements HttpClient, WsClient, WsClientAutoReconn
         logger.debug("WS ping sent: generation={}, timestamp={}", context.generation, pingSentAt);
         ChannelFuture writeFuture = writePing(channel,
                 new PingWebSocketFrame(Unpooled.wrappedBuffer(WS_PING_PAYLOAD)));
+        context.pongTimeoutTask = group.schedule(
+                () -> handlePongTimeout(context, pingSentAt), pongTimeout, pongTimeoutTimeUnit);
         writeFuture.addListener(future -> {
             if (!future.isSuccess() && isCurrent(context)) {
                 Throwable cause = future.cause() != null
@@ -610,8 +614,6 @@ public class NettyHttpClient implements HttpClient, WsClient, WsClientAutoReconn
                 requestReconnect(context, cause);
             }
         });
-        context.pongTimeoutTask = group.schedule(
-                () -> handlePongTimeout(context, pingSentAt), pongTimeout, pongTimeoutTimeUnit);
     }
 
     protected ChannelFuture writePing(Channel channel, WebSocketFrame frame) {
@@ -698,6 +700,15 @@ public class NettyHttpClient implements HttpClient, WsClient, WsClientAutoReconn
                 context.generation, context.lastPongAt);
     }
 
+    @Override
+    public void disconnected(long connectionGeneration) {
+        WsConnectionContext context = wsContext;
+        if (context == null || context.generation != connectionGeneration) {
+            return;
+        }
+        notifyDisconnected(context);
+    }
+
     /**
      * The ability to turn on/off the websocket auto reconnect, defaulted to on
      *
@@ -749,6 +760,8 @@ public class NettyHttpClient implements HttpClient, WsClient, WsClientAutoReconn
         if (context == null || cause == null) {
             return;
         }
+
+        notifyDisconnected(context);
 
         int attempt = 0;
         long reconnectDelay = 0L;
@@ -809,6 +822,23 @@ public class NettyHttpClient implements HttpClient, WsClient, WsClientAutoReconn
 
         logger.warn("WS reconnect scheduled: generation={}, attempt={}, delay={}, delayUnit={}, cause={}",
                 context.generation, attempt, reconnectDelay, reconnectDelayTimeUnit, cause.getMessage());
+    }
+
+    private void notifyDisconnected(WsConnectionContext context) {
+        if (!isCurrent(context) || !context.handshakeComplete
+                || !context.disconnectNotified.compareAndSet(false, true)) {
+            return;
+        }
+        HttpResponseHandler callback = wsCallback;
+        if (callback == null) {
+            return;
+        }
+        try {
+            callback.onDisconnect();
+        } catch (RuntimeException e) {
+            logger.warn("WS disconnect callback failed: generation={}, cause={}",
+                    context.generation, e.getMessage(), e);
+        }
     }
 
     private long reconnectDelay(int attempt) {
