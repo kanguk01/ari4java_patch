@@ -8,6 +8,7 @@ import ch.loway.oss.ari4java.generated.ari_0_0_1.actions.ActionBridges_impl_ari_
 import ch.loway.oss.ari4java.generated.ari_0_0_1.models.Bridge_impl_ari_0_0_1;
 import ch.loway.oss.ari4java.generated.ari_1_0_0.actions.*;
 import ch.loway.oss.ari4java.generated.models.Bridge;
+import ch.loway.oss.ari4java.generated.models.ChannelToneDetected;
 import ch.loway.oss.ari4java.generated.models.Mailbox;
 import ch.loway.oss.ari4java.tools.*;
 import ch.loway.oss.ari4java.tools.http.NettyHttpClient;
@@ -107,6 +108,23 @@ public class ARITest {
         assertEquals(ActionPlaybacks_impl_ari_1_0_0.class.toString(), ari.playbacks().getClass().toString());
         assertEquals(ActionRecordings_impl_ari_1_0_0.class.toString(), ari.recordings().getClass().toString());
         assertEquals(ActionSounds_impl_ari_1_0_0.class.toString(), ari.sounds().getClass().toString());
+    }
+
+    @Test
+    public void testOraAriTenBindingsRemainResolvable() throws Exception {
+        ARI ari = new ARI();
+        ari.setVersion(AriVersion.ARI_10_0_0);
+        ari.setHttpClient(mock(HttpClient.class));
+        ari.setWsClient(mock(WsClient.class));
+
+        assertEquals(
+                "ch.loway.oss.ari4java.generated.ari_10_0_0.actions.ActionEvents_impl_ari_10_0_0",
+                ari.events().getClass().getName()
+        );
+        assertEquals(
+                "ch.loway.oss.ari4java.generated.ari_10_0_0.models.ChannelToneDetected_impl_ari_10_0_0",
+                ari.getModelImpl(ChannelToneDetected.class).getClass().getName()
+        );
     }
 
     @Test
