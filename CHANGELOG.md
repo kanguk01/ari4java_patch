@@ -12,6 +12,7 @@
 - Correct active-connection exception handling and suppress reconnects during intentional shutdown.
 - Preserve the generated ARI 10.0.0 API bindings used by OraServer.
 - Expose the reconnect-attempt policy through `ARI#setWsMaxReconnectCount`, allowing OraServer to keep one subscription recovering indefinitely without creating a competing application-level WebSocket.
+- Add `ARI#destroy` for local resource shutdown without a blocking ARI unsubscribe request when Asterisk is unavailable.
 
 ## [0.17.0]
 [0.17.0]: https://github.com/ari4java/ari4java/compare/v0.16.0...v0.17.0

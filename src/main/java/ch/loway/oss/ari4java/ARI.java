@@ -228,6 +228,16 @@ public class ARI {
         } catch (ARIException e) {
             // ignore on cleanup...
         }
+        destroy();
+    }
+
+    /**
+     * Close live WebSocket actions and release client event loops without
+     * making the synchronous ARI unsubscribe requests performed by
+     * {@link #cleanup()}. This is suitable for process shutdown when the
+     * Asterisk endpoint may already be unavailable.
+     */
+    public void destroy() {
         for (BaseAriAction liveAction : liveActionList) {
             try {
                 closeAction(liveAction);

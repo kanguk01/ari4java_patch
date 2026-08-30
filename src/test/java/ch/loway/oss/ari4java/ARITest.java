@@ -123,6 +123,21 @@ public class ARITest {
     }
 
     @Test
+    public void testDestroyReleasesClientsWithoutAriUnsubscribeRequest() {
+        ARI ari = new ARI();
+        HttpClient httpClient = mock(HttpClient.class);
+        WsClient wsClient = mock(WsClient.class);
+        ari.setHttpClient(httpClient);
+        ari.setWsClient(wsClient);
+
+        ari.destroy();
+
+        verify(wsClient).destroy();
+        verify(httpClient).destroy();
+        verifyNoMoreInteractions(httpClient, wsClient);
+    }
+
+    @Test
     public void testConfigureWebSocketReconnectLimit() {
         ARI ari = new ARI();
         WsClient reconnectingClient = mock(WsClient.class,
