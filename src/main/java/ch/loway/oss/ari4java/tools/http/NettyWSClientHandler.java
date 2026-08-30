@@ -11,6 +11,8 @@ import io.netty.handler.codec.http.websocketx.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.concurrent.atomic.AtomicBoolean;
+
 
 /**
  * NettyWSClientHandler handles the transactions with the remote
@@ -21,22 +23,36 @@ import org.slf4j.LoggerFactory;
  */
 @ChannelHandler.Sharable
 public class NettyWSClientHandler extends NettyHttpClientHandler {
-    
+
+    private static final long UNTRACKED_CONNECTION = -1L;
+
     final WebSocketClientHandshaker handshaker;
     private ChannelPromise handshakeFuture;
     final HttpResponseHandler wsCallback;
-    private WsClientAutoReconnect wsClient = null;
-    private boolean shuttingDown = false;
-    private Logger logger = LoggerFactory.getLogger(NettyWSClientHandler.class);
+    private final WsClientAutoReconnect wsClient;
+    private final long connectionGeneration;
+    private final AtomicBoolean reconnectRequested = new AtomicBoolean(false);
+    private volatile boolean shuttingDown = false;
+    private final Logger logger = LoggerFactory.getLogger(NettyWSClientHandler.class);
 
     public NettyWSClientHandler(WebSocketClientHandshaker handshaker, HttpResponseHandler wsCallback, WsClientAutoReconnect wsClient) {
-        this(handshaker, wsCallback);
-        this.wsClient = wsClient;
+        this(handshaker, wsCallback, wsClient, UNTRACKED_CONNECTION);
     }
 
     public NettyWSClientHandler(WebSocketClientHandshaker handshaker, HttpResponseHandler wsCallback) {
+        this(handshaker, wsCallback, null, UNTRACKED_CONNECTION);
+    }
+
+    NettyWSClientHandler(
+            WebSocketClientHandshaker handshaker,
+            HttpResponseHandler wsCallback,
+            WsClientAutoReconnect wsClient,
+            long connectionGeneration
+    ) {
         this.handshaker = handshaker;
         this.wsCallback = wsCallback;
+        this.wsClient = wsClient;
+        this.connectionGeneration = connectionGeneration;
     }
 
     public ChannelFuture handshakeFuture() {
@@ -56,9 +72,12 @@ public class NettyWSClientHandler extends NettyHttpClientHandler {
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
         if (!shuttingDown && this.wsClient != null) {
-            logger.debug("WS channel inactive - {}", ctx);
-            wsCallback.onDisconnect();
-            wsClient.reconnectWs(new RestException("WS channel inactive"));
+            logger.debug("WS channel inactive: generation={}, context={}", connectionGeneration, ctx);
+            try {
+                wsCallback.onDisconnect();
+            } finally {
+                requestReconnect(new RestException("WS channel inactive"));
+            }
         }
     }
 
@@ -75,7 +94,7 @@ public class NettyWSClientHandler extends NettyHttpClientHandler {
             if (!handshaker.isHandshakeComplete()) {
                 logger.debug("Finish WS Handshake...");
                 handshaker.finishHandshake(ch, response);
-                handshakeFuture.setSuccess();
+                handshakeFuture.trySuccess();
                 return;
             }
             String error = "Unexpected FullHttpResponse (getStatus=" + response.status().toString() + ", content=" + getResponseText() + ')';
@@ -93,16 +112,16 @@ public class NettyWSClientHandler extends NettyHttpClientHandler {
             responseBytes = text.getBytes(ARIEncoder.ENCODING);
             wsCallback.onSuccess(text);
         } else if (msg instanceof CloseWebSocketFrame) {
-            ch.close();
             if (!shuttingDown) {
                 if (this.wsClient != null) {
-                    wsClient.reconnectWs(new RestException("CloseWebSocketFrame received"));
+                    requestReconnect(new RestException("CloseWebSocketFrame received"));
                 } else {
                     wsCallback.onDisconnect();
                 }
             }
+            ch.close();
         } else if (msg instanceof PongWebSocketFrame) {
-            wsClient.pong();
+            recordPong();
         } else {
             HTTPLogger.traceWebSocketFrame(msg.toString());
             String error = "Not expecting: " + msg.getClass().getSimpleName();
@@ -113,15 +132,44 @@ public class NettyWSClientHandler extends NettyHttpClientHandler {
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
-        if (!shuttingDown)
+        if (shuttingDown) {
             return;
-        logger.error("exceptionCaught: {}", cause.getMessage(), cause);
-        if (!handshakeFuture.isDone()) {
-            handshakeFuture.setFailure(cause);
         }
-        ctx.fireExceptionCaught(cause);
+
+        logger.warn("WS exception: generation={}, cause={}", connectionGeneration, cause.getMessage(), cause);
+        if (handshakeFuture != null && !handshakeFuture.isDone()) {
+            handshakeFuture.tryFailure(cause);
+        }
+        if (wsClient != null) {
+            requestReconnect(cause);
+        } else {
+            wsCallback.onFailure(cause);
+        }
         ctx.close();
-        wsCallback.onFailure(cause);
+    }
+
+    private void requestReconnect(Throwable cause) {
+        if (!reconnectRequested.compareAndSet(false, true)) {
+            logger.debug("WS reconnect already requested by handler: generation={}, cause={}",
+                    connectionGeneration, cause.getMessage());
+            return;
+        }
+        if (wsClient instanceof NettyWsConnectionLifecycle && connectionGeneration != UNTRACKED_CONNECTION) {
+            ((NettyWsConnectionLifecycle) wsClient).reconnectWs(cause, connectionGeneration);
+            return;
+        }
+        wsClient.reconnectWs(cause);
+    }
+
+    private void recordPong() {
+        if (wsClient == null) {
+            return;
+        }
+        if (wsClient instanceof NettyWsConnectionLifecycle && connectionGeneration != UNTRACKED_CONNECTION) {
+            ((NettyWsConnectionLifecycle) wsClient).pong(connectionGeneration);
+            return;
+        }
+        wsClient.pong();
     }
 
     public boolean isShuttingDown() {
@@ -132,4 +180,3 @@ public class NettyWSClientHandler extends NettyHttpClientHandler {
         this.shuttingDown = shuttingDown;
     }
 }
-

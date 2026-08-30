@@ -123,6 +123,29 @@ public class ARITest {
     }
 
     @Test
+    public void testConfigureWebSocketReconnectLimit() {
+        ARI ari = new ARI();
+        WsClient reconnectingClient = mock(WsClient.class,
+                withSettings().extraInterfaces(WsClientAutoReconnect.class));
+        ari.setWsClient(reconnectingClient);
+
+        ari.setWsMaxReconnectCount(-1);
+
+        verify((WsClientAutoReconnect) reconnectingClient).setMaxReconnectCount(-1);
+    }
+
+    @Test
+    public void testConfigureWebSocketReconnectLimitRejectsUnsupportedClient() {
+        ARI ari = new ARI();
+        ari.setWsClient(mock(WsClient.class));
+
+        ARIRuntimeException error = assertThrows(ARIRuntimeException.class,
+                () -> ari.setWsMaxReconnectCount(-1));
+
+        assertEquals("WebSocket client does not support automatic reconnect", error.getMessage());
+    }
+
+    @Test
     public void testBuild() throws Exception {
         when(client.httpActionSync(eq("/applications/test"), eq("GET"), any(), any(), any())).thenReturn(
                 "{\"channel_ids\": [], \"bridge_ids\": [], \"endpoint_ids\": [], \"device_names\": []}"

@@ -53,6 +53,19 @@ public class ARI {
     }
 
     /**
+     * Configure the WebSocket client's consecutive reconnect limit.
+     *
+     * @param count maximum reconnect attempts, or {@code -1} for no limit
+     * @throws ARIRuntimeException when the configured client does not support reconnects
+     */
+    public void setWsMaxReconnectCount(int count) {
+        if (!(wsClient instanceof WsClientAutoReconnect)) {
+            throw new ARIRuntimeException("WebSocket client does not support automatic reconnect");
+        }
+        ((WsClientAutoReconnect) wsClient).setMaxReconnectCount(count);
+    }
+
+    /**
      * Sets the Version
      *
      * @param version the version

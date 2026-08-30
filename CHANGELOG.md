@@ -3,6 +3,16 @@
 ## [Unreleased]
 [Unreleased]: https://github.com/ari4java/ari4java/compare/v0.17.0...HEAD
 
+### Ora 0.17.1-ora.1
+
+- Associate WebSocket heartbeat, timeout, Pong, and reconnect callbacks with the connection generation that created them.
+- Replace the blocking Pong wait loop with Netty scheduled timeouts.
+- Coalesce overlapping reconnect causes into one backoff attempt and ignore stale scheduled work after recovery.
+- Treat recoverable transport failures as warnings and invoke the failure callback only after retry exhaustion.
+- Correct active-connection exception handling and suppress reconnects during intentional shutdown.
+- Preserve the generated ARI 10.0.0 API bindings used by OraServer.
+- Expose the reconnect-attempt policy through `ARI#setWsMaxReconnectCount`, allowing OraServer to keep one subscription recovering indefinitely without creating a competing application-level WebSocket.
+
 ## [0.17.0]
 [0.17.0]: https://github.com/ari4java/ari4java/compare/v0.16.0...v0.17.0
 ### Added

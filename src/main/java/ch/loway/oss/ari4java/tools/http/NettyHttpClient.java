@@ -26,6 +26,7 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * HTTP and WebSocket client implementation based on netty.io.
@@ -37,7 +38,7 @@ import java.util.concurrent.TimeUnit;
  *
  * @author mwalton
  */
-public class NettyHttpClient implements HttpClient, WsClient, WsClientAutoReconnect {
+public class NettyHttpClient implements HttpClient, WsClient, WsClientAutoReconnect, NettyWsConnectionLifecycle {
 
     public static final int CONNECTION_TIMEOUT_SEC = 10;
     public static final int READ_TIMEOUT_SEC = 30;
@@ -49,8 +50,12 @@ public class NettyHttpClient implements HttpClient, WsClient, WsClientAutoReconn
     private static final String HTTP_CODEC = "http-codec";
     private static final String HTTP_AGGREGATOR = "http-aggregator";
     private static final String HTTP_HANDLER = "http-handler";
+    private static final long[] DEFAULT_RECONNECT_DELAYS = {2L, 5L, 10L};
+    private static final byte[] WS_PING_PAYLOAD = "ari4j".getBytes(ARIEncoder.ENCODING);
 
-    private Logger logger = LoggerFactory.getLogger(NettyHttpClient.class);
+    private final Logger logger = LoggerFactory.getLogger(NettyHttpClient.class);
+    private final Object wsLifecycleLock = new Object();
+    private final AtomicLong wsGenerationSequence = new AtomicLong();
 
     protected Bootstrap httpBootstrap;
     protected URI baseUri;
@@ -61,21 +66,44 @@ public class NettyHttpClient implements HttpClient, WsClient, WsClientAutoReconn
     private HttpResponseHandler wsCallback;
     private String wsEventsUrl;
     private List<HttpParam> wsEventsParamQuery;
-    private WsClientConnection wsClientConnection;
-    private int reconnectCount = -1;
+    private volatile WsClientConnection wsClientConnection;
+    private int reconnectCount = 0;
     private int maxReconnectCount = 10; // -1 = infinite reconnect attempts
-    private ChannelFuture wsChannelFuture;
-    private ScheduledFuture<?> wsPingTimer = null;
-    private ScheduledFuture<?> wsConnectionTimeout = null;
-    protected NettyWSClientHandler wsHandler;
-    protected ChannelFutureListener wsFuture;
+    private volatile WsConnectionContext wsContext;
+    protected volatile NettyWSClientHandler wsHandler;
+    protected volatile ChannelFutureListener wsFuture;
     private static SslContext sslContext;
 
-    private int pongFailureCount = 0;
-    private long lastPong = 0;
-    private static boolean autoReconnect = true;
+    private volatile boolean destroyed;
+    private static volatile boolean autoReconnect = true;
     protected int pingPeriod = 5;
     protected TimeUnit pingTimeUnit = TimeUnit.MINUTES;
+    protected long pingIdleThresholdMillis = 15_000L;
+    protected long pongTimeout = 10L;
+    protected TimeUnit pongTimeoutTimeUnit = TimeUnit.SECONDS;
+    protected long connectionTimeout = CONNECTION_TIMEOUT_SEC;
+    protected TimeUnit connectionTimeoutTimeUnit = TimeUnit.SECONDS;
+    protected long[] reconnectDelays = DEFAULT_RECONNECT_DELAYS.clone();
+    protected TimeUnit reconnectDelayTimeUnit = TimeUnit.SECONDS;
+
+    private static final class WsConnectionContext {
+        private final long generation;
+        private final NettyWSClientHandler handler;
+        private volatile ChannelFuture channelFuture;
+        private volatile ChannelFutureListener connectListener;
+        private volatile ScheduledFuture<?> connectionTimeoutTask;
+        private volatile ScheduledFuture<?> pingTask;
+        private volatile ScheduledFuture<?> pongTimeoutTask;
+        private volatile ScheduledFuture<?> reconnectTask;
+        private volatile long lastPongAt;
+        private volatile boolean handshakeComplete;
+        private boolean terminalFailureNotified;
+
+        private WsConnectionContext(long generation, NettyWSClientHandler handler) {
+            this.generation = generation;
+            this.handler = handler;
+        }
+    }
 
     public NettyHttpClient() {
         group = new NioEventLoopGroup();
@@ -160,39 +188,43 @@ public class NettyHttpClient implements HttpClient, WsClient, WsClientAutoReconn
 
     @Override
     public void destroy() {
-        logger.debug("destroy...");
-        // use a different event group to execute the shutdown to avoid deadlocks
-        shutDownGroup.execute(() -> {
-            logger.debug("running shutdown...");
-            if (wsPingTimer != null) {
-                logger.debug("cancel ping...");
-                wsPingTimer.cancel(true);
-                wsPingTimer = null;
+        WsConnectionContext context;
+        EventLoopGroup ioGroup;
+        EventLoopGroup cleanupGroup;
+        synchronized (wsLifecycleLock) {
+            if (destroyed) {
+                return;
             }
-            if (wsConnectionTimeout != null) {
-                logger.debug("cancel wsConnectionTimeout...");
-                wsConnectionTimeout.cancel(true);
-                wsConnectionTimeout = null;
+            destroyed = true;
+            context = wsContext;
+            clearCurrentContextLocked(context);
+            wsClientConnection = null;
+            ioGroup = group;
+            cleanupGroup = shutDownGroup;
+        }
+
+        cancelContextTasks(context);
+        closeContext(context, true);
+
+        io.netty.util.concurrent.Future<?> ioShutdown = null;
+        io.netty.util.concurrent.Future<?> cleanupShutdown = null;
+        if (ioGroup != null && !ioGroup.isShuttingDown()) {
+            ioShutdown = ioGroup.shutdownGracefully(0, 1, TimeUnit.SECONDS);
+        }
+        if (cleanupGroup != null && !cleanupGroup.isShuttingDown()) {
+            cleanupShutdown = cleanupGroup.shutdownGracefully(0, 5, TimeUnit.SECONDS);
+        }
+        if (!isInEventLoop(ioGroup) && !isInEventLoop(cleanupGroup)) {
+            if (ioShutdown != null) {
+                ioShutdown.syncUninterruptibly();
             }
-            if (wsClientConnection != null) {
-                try {
-                    logger.debug("there is a web socket, disconnect...");
-                    wsClientConnection.disconnect();
-                    wsClientConnection = null;
-                } catch (RestException e) {
-                    // not bubbling exception up, just ignoring
-                }
+            if (cleanupShutdown != null) {
+                cleanupShutdown.syncUninterruptibly();
             }
-            if (group != null && !group.isShuttingDown()) {
-                logger.debug("group shutdownGracefully");
-                group.shutdownGracefully(0, 1, TimeUnit.SECONDS).syncUninterruptibly();
-                group = null;
-                logger.debug("group shutdown complete");
-            }
-        });
-        shutDownGroup.shutdownGracefully(0, 5, TimeUnit.SECONDS).syncUninterruptibly();
+        }
+        group = null;
         shutDownGroup = null;
-        logger.debug("... destroyed");
+        logger.debug("WebSocket client destroyed");
     }
 
     protected String buildURL(String path, List<HttpParam> parametersQuery, boolean withAddress) {
@@ -373,23 +405,62 @@ public class NettyHttpClient implements HttpClient, WsClient, WsClientAutoReconn
 
     @Override
     public WsClientConnection connect(final HttpResponseHandler callback, final String url, final List<HttpParam> lParamQuery) throws RestException {
-        if (isWsConnected()) {
-            return wsClientConnection;
-        }
         try {
+            WsConnectionContext existing = wsContext;
+            if (isLiveOrConnecting(existing)) {
+                return createWsClientConnection();
+            }
+
             WebSocketClientHandshaker handshake = getWsHandshake(url, lParamQuery);
             logger.debug("WS Connect uri: {}", handshake.uri());
-            this.wsEventsUrl = url;
-            this.wsEventsParamQuery = lParamQuery;
-            this.wsHandler = new NettyWSClientHandler(handshake, callback, this);
-            this.wsCallback = callback;
+            WsConnectionContext context;
+            synchronized (wsLifecycleLock) {
+                if (destroyed || group == null || group.isShuttingDown()) {
+                    throw new RestException("WebSocket client is shut down");
+                }
+                existing = wsContext;
+                if (isLiveOrConnecting(existing)) {
+                    return createWsClientConnection();
+                }
+
+                long generation = wsGenerationSequence.incrementAndGet();
+                NettyWSClientHandler handler = new NettyWSClientHandler(handshake, callback, this, generation);
+                context = new WsConnectionContext(generation, handler);
+                wsEventsUrl = url;
+                wsEventsParamQuery = lParamQuery;
+                wsCallback = callback;
+                wsContext = context;
+                wsHandler = handler;
+            }
             return connect(new Bootstrap(), callback);
         } catch (Exception e) {
+            if (e instanceof RestException) {
+                throw (RestException) e;
+            }
             throw new RestException("WS Connection Error - " + e.getMessage(), e);
         }
     }
 
     protected WsClientConnection connect(Bootstrap wsBootStrap, final HttpResponseHandler callback) {
+        WsConnectionContext context = wsContext;
+        if (context == null) {
+            NettyWSClientHandler handler = wsHandler;
+            if (handler == null) {
+                throw new IllegalStateException("WebSocket handler must be configured before connecting");
+            }
+            synchronized (wsLifecycleLock) {
+                context = new WsConnectionContext(wsGenerationSequence.incrementAndGet(), handler);
+                wsContext = context;
+            }
+        }
+        return connect(wsBootStrap, callback, context);
+    }
+
+    private WsClientConnection connect(
+            Bootstrap wsBootStrap,
+            final HttpResponseHandler callback,
+            final WsConnectionContext context
+    ) {
         bootstrapOptions(wsBootStrap);
         wsBootStrap.handler(new ChannelInitializer<SocketChannel>() {
             @Override
@@ -398,129 +469,181 @@ public class NettyHttpClient implements HttpClient, WsClient, WsClientAutoReconn
                 addSSLIfRequired(pipeline, baseUri);
                 pipeline.addLast(HTTP_CODEC, new HttpClientCodec());
                 pipeline.addLast(HTTP_AGGREGATOR, new HttpObjectAggregator(MAX_HTTP_REQUEST));
-                pipeline.addLast("ws-handler", wsHandler);
+                pipeline.addLast("ws-handler", context.handler);
             }
         });
-        wsConnectionTimeout = group.schedule(
-                () -> reconnectWs(new RestException("WS Connect Timeout")), CONNECTION_TIMEOUT_SEC, TimeUnit.SECONDS);
-        wsChannelFuture = wsBootStrap.connect(baseUri.getHost(), getPort());
-        wsFuture = new ChannelFutureListener() {
-            @Override
-            public void operationComplete(ChannelFuture future) throws Exception {
-                if (future.isSuccess()) {
-                    logger.debug("HTTP connected, waiting for WS Upgrade...");
-                    wsHandler.handshakeFuture().addListener(new ChannelFutureListener() {
-                        @Override
-                        public void operationComplete(ChannelFuture future) throws Exception {
-                            // cancel the connection timeout
-                            cancelWsConnectionTimeout();
-                            if (future.isSuccess()) {
-                                logger.debug("WS connected...");
-                                // start a ping and reset reconnect counter
-                                startPing();
-                                reconnectCount = 0;
-                                callback.onChReadyToWrite();
-                            } else {
-                                if (future.cause() != null) {
-                                    logger.error("WS Upgrade Error - {}", future.cause().getMessage(), future.cause());
-                                    reconnectWs(future.cause());
-                                } else {
-                                    logger.error("WS Upgrade Error - Unknown");
-                                    reconnectWs(new RestException("WS Upgrade Error - Unknown"));
-                                }
-                            }
-                        }
-                    });
-                } else {
-                    cancelWsConnectionTimeout();
-                    if (future.cause() != null) {
-                        logger.error("WS/HTTP Connection Error - {}", future.cause().getMessage(), future.cause());
-                        reconnectWs(future.cause());
-                    } else {
-                        logger.error("WS/HTTP Connection Error - Unknown");
-                        reconnectWs(new RestException("WS/HTTP Connection Error - Unknown"));
-                    }
+
+        ChannelFuture channelFuture;
+        try {
+            channelFuture = wsBootStrap.connect(baseUri.getHost(), getPort());
+        } catch (RuntimeException e) {
+            synchronized (wsLifecycleLock) {
+                if (isCurrent(context)) {
+                    context.handler.setShuttingDown(true);
+                    clearCurrentContextLocked(context);
                 }
             }
-        };
-        wsChannelFuture.addListener(wsFuture);
+            cancelContextTasks(context);
+            throw e;
+        }
+        context.channelFuture = channelFuture;
+        context.connectionTimeoutTask = group.schedule(
+                () -> handleConnectionTimeout(context), connectionTimeout, connectionTimeoutTimeUnit);
+        ChannelFutureListener connectListener = future -> handleConnectResult(context, callback, future);
+        context.connectListener = connectListener;
+        wsFuture = connectListener;
+        channelFuture.addListener(connectListener);
 
         // Provide disconnection handle to client
         return createWsClientConnection();
     }
 
-    private void cancelWsConnectionTimeout() {
-        if (wsConnectionTimeout != null) {
-            wsConnectionTimeout.cancel(true);
-            wsConnectionTimeout = null;
+    private void handleConnectResult(
+            WsConnectionContext context,
+            HttpResponseHandler callback,
+            ChannelFuture future
+    ) {
+        if (!isCurrent(context)) {
+            closeChannel(future.channel());
+            return;
         }
+        if (!future.isSuccess()) {
+            cancelConnectionTimeout(context);
+            Throwable cause = future.cause() != null
+                    ? future.cause()
+                    : new RestException("WS/HTTP Connection Error - Unknown");
+            logger.warn("WS transport connection failed: generation={}, cause={}",
+                    context.generation, cause.getMessage(), cause);
+            requestReconnect(context, cause);
+            return;
+        }
+
+        logger.debug("HTTP connected, waiting for WS Upgrade: generation={}", context.generation);
+        ChannelFuture handshakeFuture = context.handler.handshakeFuture();
+        if (handshakeFuture == null) {
+            requestReconnect(context, new RestException("WS handshake promise was not initialized"));
+            return;
+        }
+        handshakeFuture.addListener((ChannelFutureListener)
+                future1 -> handleHandshakeResult(context, callback, future1));
     }
 
-    private void startPing() {
-        if (wsPingTimer == null) {
-            pongFailureCount = 0;
-            wsPingTimer = group.scheduleAtFixedRate(() -> {
-                if (isWsConnected() && (System.currentTimeMillis() - wsCallback.getLastResponseTime()) > 15000) {
-                    WebSocketFrame frame = new PingWebSocketFrame(Unpooled.wrappedBuffer("ari4j".getBytes(ARIEncoder.ENCODING)));
-                    logger.debug("Send Ping at {}", System.currentTimeMillis());
-                    wsChannelFuture.channel().writeAndFlush(frame);
-                    boolean noPong = true;
-                    for (int i = 0; i < 10; i++) {
-                        if (wsHandler != null && wsHandler.isShuttingDown()) {
-                            break;
-                        }
-                        try {
-                            Thread.sleep(1000);
-                        } catch (InterruptedException e) {//NOSONAR
-                            // probably from the reconnect, so stop running...
-                            return;
-                        }
-                        if ((System.currentTimeMillis() - lastPong) < 10000) {
-                            logger.debug("Pong at {}", lastPong);
-                            pongFailureCount = 0;
-                            noPong = false;
-                            break;
-                        } else {
-                            logger.warn("No Pong at {}", System.currentTimeMillis());
-                        }
-                    }
-                    if (noPong && wsHandler != null && !wsHandler.isShuttingDown()) {
-                        pongFailureCount++;
-                        if (pongFailureCount >= 1) {
-                            logger.warn("No Ping response from server, reconnect...");
-                            reconnectWs(new RestException("No Ping response from server"));
-                        }
-                    }
-                }
-            }, 1, pingPeriod, pingTimeUnit);
+    private void handleHandshakeResult(
+            WsConnectionContext context,
+            HttpResponseHandler callback,
+            ChannelFuture future
+    ) {
+        cancelConnectionTimeout(context);
+        if (!isCurrent(context)) {
+            closeChannel(future.channel());
+            return;
         }
+        if (!future.isSuccess()) {
+            Throwable cause = future.cause() != null
+                    ? future.cause()
+                    : new RestException("WS Upgrade Error - Unknown");
+            logger.warn("WS upgrade failed: generation={}, cause={}",
+                    context.generation, cause.getMessage(), cause);
+            requestReconnect(context, cause);
+            return;
+        }
+
+        context.handshakeComplete = true;
+        synchronized (wsLifecycleLock) {
+            if (!isCurrent(context)) {
+                return;
+            }
+            reconnectCount = 0;
+            context.terminalFailureNotified = false;
+        }
+        startPing(context);
+        logger.info("WS connected: generation={}", context.generation);
+        callback.onChReadyToWrite();
+    }
+
+    private void handleConnectionTimeout(WsConnectionContext context) {
+        if (!isCurrent(context) || context.handshakeComplete) {
+            return;
+        }
+        requestReconnect(context, new RestException("WS Connect Timeout"));
+    }
+
+    private void cancelConnectionTimeout(WsConnectionContext context) {
+        ScheduledFuture<?> timeoutTask = context.connectionTimeoutTask;
+        context.connectionTimeoutTask = null;
+        cancelFuture(timeoutTask);
+    }
+
+    private void startPing(WsConnectionContext context) {
+        if (!isCurrent(context)) {
+            return;
+        }
+        cancelFuture(context.pingTask);
+        context.pingTask = group.scheduleAtFixedRate(
+                () -> sendPingIfIdle(context), 1L, pingPeriod, pingTimeUnit);
+    }
+
+    private void sendPingIfIdle(WsConnectionContext context) {
+        if (!isConnected(context)) {
+            return;
+        }
+        ScheduledFuture<?> pendingPongTimeout = context.pongTimeoutTask;
+        if (pendingPongTimeout != null && !pendingPongTimeout.isDone()) {
+            return;
+        }
+
+        long now = System.currentTimeMillis();
+        if (now - wsCallback.getLastResponseTime() <= pingIdleThresholdMillis) {
+            return;
+        }
+
+        Channel channel = context.channelFuture.channel();
+        long pingSentAt = now;
+        logger.debug("WS ping sent: generation={}, timestamp={}", context.generation, pingSentAt);
+        ChannelFuture writeFuture = writePing(channel,
+                new PingWebSocketFrame(Unpooled.wrappedBuffer(WS_PING_PAYLOAD)));
+        writeFuture.addListener(future -> {
+            if (!future.isSuccess() && isCurrent(context)) {
+                Throwable cause = future.cause() != null
+                        ? future.cause()
+                        : new RestException("WS Ping write failed");
+                requestReconnect(context, cause);
+            }
+        });
+        context.pongTimeoutTask = group.schedule(
+                () -> handlePongTimeout(context, pingSentAt), pongTimeout, pongTimeoutTimeUnit);
+    }
+
+    protected ChannelFuture writePing(Channel channel, WebSocketFrame frame) {
+        return channel.writeAndFlush(frame);
+    }
+
+    private void handlePongTimeout(WsConnectionContext context, long pingSentAt) {
+        context.pongTimeoutTask = null;
+        if (!isCurrent(context) || context.lastPongAt >= pingSentAt) {
+            return;
+        }
+        requestReconnect(context, new RestException("No Ping response from server"));
     }
 
     private WsClientConnection createWsClientConnection() {
-        if (this.wsClientConnection == null) {
-            this.wsClientConnection = new WsClientConnection() {
+        WsClientConnection connection = wsClientConnection;
+        if (connection == null) {
+            synchronized (wsLifecycleLock) {
+                connection = wsClientConnection;
+                if (connection == null) {
+                    connection = new WsClientConnection() {
 
-                @Override
-                public void disconnect() throws RestException {
-                    wsHandler.setShuttingDown(true);
-                    Channel ch = wsChannelFuture.channel();
-                    if (ch != null) {
-                        // if connected send CloseWebSocketFrame as NettyWSClientHandler will close the connection when the server responds to it
-                        if (reconnectCount == 0) {
-                            logger.debug("Send CloseWebSocketFrame ...");
-                            // set to -1 so we don't try send another close frame
-                            reconnectCount = -1;
-                            ch.writeAndFlush(new CloseWebSocketFrame());
+                        @Override
+                        public void disconnect() throws RestException {
+                            disconnectCurrentConnection();
                         }
-                        // if the server is no longer there then close any way
-                        ch.close();
-                    }
-                    wsChannelFuture.removeListener(wsFuture);
-                    wsChannelFuture.cancel(true);
+                    };
+                    wsClientConnection = connection;
                 }
-            };
+            }
         }
-        return this.wsClientConnection;
+        return connection;
     }
 
     /**
@@ -539,41 +662,40 @@ public class NettyHttpClient implements HttpClient, WsClient, WsClientAutoReconn
 
     @Override
     public void reconnectWs(Throwable cause) {
-        // cancel the ping timer
-        if (wsPingTimer != null) {
-            wsPingTimer.cancel(true);
-            wsPingTimer = null;
-        }
+        requestReconnect(wsContext, cause);
+    }
 
-        if (!autoReconnect || (maxReconnectCount > -1 && reconnectCount >= maxReconnectCount)) {
-            logger.warn("Cannot connect: {} - executing failure callback", cause.getMessage());
-            wsCallback.onFailure(cause);
+    @Override
+    public void reconnectWs(Throwable cause, long connectionGeneration) {
+        WsConnectionContext context = wsContext;
+        if (context == null || context.generation != connectionGeneration) {
+            logger.debug("Ignoring stale WS reconnect request: requestedGeneration={}, currentGeneration={}",
+                    connectionGeneration, context == null ? null : context.generation);
             return;
         }
-
-        // if not shutdown reconnect, note the check not on the shutDownGroup
-        if (!group.isShuttingDown()) {
-            // schedule reconnect after a 2,5,10 seconds
-            long[] timeouts = {2L, 5L, 10L};
-            long timeout = reconnectCount >= timeouts.length ? timeouts[timeouts.length - 1] : timeouts[reconnectCount];
-            reconnectCount++;
-            logger.error("WS Connect Error: {}, reconnecting in {} seconds... try: {}", cause.getMessage(), timeout, reconnectCount);
-            shutDownGroup.schedule(() -> {
-                try {
-                    // 1st close up
-                    wsClientConnection.disconnect();
-                    // then connect again
-                    connect(wsCallback, wsEventsUrl, wsEventsParamQuery);
-                } catch (RestException e) {
-                    wsCallback.onFailure(e);
-                }
-            }, timeout, TimeUnit.SECONDS);
-        }
+        requestReconnect(context, cause);
     }
 
     @Override
     public void pong() {
-        lastPong = System.currentTimeMillis();
+        WsConnectionContext context = wsContext;
+        if (context != null) {
+            pong(context.generation);
+        }
+    }
+
+    @Override
+    public void pong(long connectionGeneration) {
+        WsConnectionContext context = wsContext;
+        if (context == null || context.generation != connectionGeneration || !isCurrent(context)) {
+            return;
+        }
+        context.lastPongAt = System.currentTimeMillis();
+        ScheduledFuture<?> timeoutTask = context.pongTimeoutTask;
+        context.pongTimeoutTask = null;
+        cancelFuture(timeoutTask);
+        logger.debug("WS pong received: generation={}, timestamp={}",
+                context.generation, context.lastPongAt);
     }
 
     /**
@@ -600,8 +722,12 @@ public class NettyHttpClient implements HttpClient, WsClient, WsClientAutoReconn
      * @return true when connected, false otherwise
      */
     public boolean isWsConnected() {
-        return wsClientConnection != null && wsHandler != null && !wsHandler.isShuttingDown() && wsChannelFuture != null &&
-                !wsChannelFuture.isCancelled() && wsChannelFuture.channel() != null && wsChannelFuture.channel().isActive();
+        return isConnected(wsContext);
+    }
+
+    long currentWsGeneration() {
+        WsConnectionContext context = wsContext;
+        return context == null ? -1L : context.generation;
     }
 
     /**
@@ -609,7 +735,229 @@ public class NettyHttpClient implements HttpClient, WsClient, WsClientAutoReconn
      *
      * @param count max number of reconnect attempts, -1 for infinite reconnecting
      */
+    @Override
     public void setMaxReconnectCount(int count) {
-        maxReconnectCount = count;
+        if (count < -1) {
+            throw new IllegalArgumentException("Reconnect count must be -1 or greater");
+        }
+        synchronized (wsLifecycleLock) {
+            maxReconnectCount = count;
+        }
+    }
+
+    private void requestReconnect(WsConnectionContext context, Throwable cause) {
+        if (context == null || cause == null) {
+            return;
+        }
+
+        int attempt = 0;
+        long reconnectDelay = 0L;
+        boolean terminalFailure = false;
+        HttpResponseHandler failureCallback = null;
+        synchronized (wsLifecycleLock) {
+            if (!isCurrent(context)) {
+                logger.debug("Ignoring stale WS reconnect cause: generation={}, cause={}",
+                        context.generation, cause.getMessage());
+                return;
+            }
+
+            cancelHeartbeatTasks(context);
+            cancelConnectionTimeout(context);
+            if (context.reconnectTask != null && !context.reconnectTask.isDone()) {
+                logger.debug("WS reconnect already scheduled: generation={}, cause={}",
+                        context.generation, cause.getMessage());
+                return;
+            }
+
+            if (!autoReconnect || (maxReconnectCount > -1 && reconnectCount >= maxReconnectCount)) {
+                if (context.terminalFailureNotified) {
+                    return;
+                }
+                context.terminalFailureNotified = true;
+                context.handler.setShuttingDown(true);
+                clearCurrentContextLocked(context);
+                terminalFailure = true;
+                failureCallback = wsCallback;
+            } else {
+                attempt = ++reconnectCount;
+                long delayForAttempt = reconnectDelay(attempt);
+                reconnectDelay = delayForAttempt;
+                EventLoopGroup reconnectGroup = shutDownGroup;
+                if (reconnectGroup == null || reconnectGroup.isShuttingDown()) {
+                    context.terminalFailureNotified = true;
+                    context.handler.setShuttingDown(true);
+                    clearCurrentContextLocked(context);
+                    terminalFailure = true;
+                    failureCallback = wsCallback;
+                } else {
+                    context.reconnectTask = reconnectGroup.schedule(
+                            () -> executeReconnect(context), delayForAttempt, reconnectDelayTimeUnit);
+                }
+            }
+        }
+
+        if (terminalFailure) {
+            cancelContextTasks(context);
+            closeContext(context, false);
+            logger.error("WS reconnect exhausted: generation={}, attempts={}, cause={}",
+                    context.generation, reconnectCount, cause.getMessage(), cause);
+            if (failureCallback != null) {
+                failureCallback.onFailure(cause);
+            }
+            return;
+        }
+
+        logger.warn("WS reconnect scheduled: generation={}, attempt={}, delay={}, delayUnit={}, cause={}",
+                context.generation, attempt, reconnectDelay, reconnectDelayTimeUnit, cause.getMessage());
+    }
+
+    private long reconnectDelay(int attempt) {
+        if (reconnectDelays == null || reconnectDelays.length == 0) {
+            return DEFAULT_RECONNECT_DELAYS[DEFAULT_RECONNECT_DELAYS.length - 1];
+        }
+        int index = Math.min(Math.max(attempt - 1, 0), reconnectDelays.length - 1);
+        return reconnectDelays[index];
+    }
+
+    private void executeReconnect(WsConnectionContext context) {
+        HttpResponseHandler callback;
+        String eventsUrl;
+        List<HttpParam> eventParameters;
+        synchronized (wsLifecycleLock) {
+            context.reconnectTask = null;
+            if (!isCurrent(context)) {
+                logger.debug("Skipping stale scheduled WS reconnect: generation={}", context.generation);
+                return;
+            }
+            context.handler.setShuttingDown(true);
+            clearCurrentContextLocked(context);
+            callback = wsCallback;
+            eventsUrl = wsEventsUrl;
+            eventParameters = wsEventsParamQuery;
+        }
+
+        cancelContextTasks(context);
+        closeContext(context, false);
+        try {
+            connect(callback, eventsUrl, eventParameters);
+        } catch (RestException e) {
+            logger.error("WS reconnect could not create a new connection: previousGeneration={}, cause={}",
+                    context.generation, e.getMessage(), e);
+            if (callback != null) {
+                callback.onFailure(e);
+            }
+        }
+    }
+
+    private void disconnectCurrentConnection() {
+        WsConnectionContext context;
+        synchronized (wsLifecycleLock) {
+            context = wsContext;
+            if (context == null) {
+                return;
+            }
+            context.handler.setShuttingDown(true);
+            clearCurrentContextLocked(context);
+            reconnectCount = 0;
+        }
+        cancelContextTasks(context);
+        closeContext(context, true);
+    }
+
+    private void cancelContextTasks(WsConnectionContext context) {
+        if (context == null) {
+            return;
+        }
+        cancelConnectionTimeout(context);
+        cancelHeartbeatTasks(context);
+        ScheduledFuture<?> reconnectTask = context.reconnectTask;
+        context.reconnectTask = null;
+        cancelFuture(reconnectTask);
+    }
+
+    private void cancelHeartbeatTasks(WsConnectionContext context) {
+        ScheduledFuture<?> pingTask = context.pingTask;
+        context.pingTask = null;
+        cancelFuture(pingTask);
+        ScheduledFuture<?> pongTimeoutTask = context.pongTimeoutTask;
+        context.pongTimeoutTask = null;
+        cancelFuture(pongTimeoutTask);
+    }
+
+    private void closeContext(WsConnectionContext context, boolean sendCloseFrame) {
+        if (context == null) {
+            return;
+        }
+        context.handler.setShuttingDown(true);
+        ChannelFuture channelFuture = context.channelFuture;
+        if (channelFuture == null) {
+            return;
+        }
+        ChannelFutureListener connectListener = context.connectListener;
+        if (connectListener != null) {
+            channelFuture.removeListener(connectListener);
+        }
+        Channel channel = channelFuture.channel();
+        if (channel != null) {
+            if (sendCloseFrame && context.handshakeComplete && channel.isActive()) {
+                channel.writeAndFlush(new CloseWebSocketFrame());
+            }
+            closeChannel(channel);
+        }
+        if (!channelFuture.isDone()) {
+            channelFuture.cancel(false);
+        }
+    }
+
+    private void closeChannel(Channel channel) {
+        if (channel != null && channel.isOpen()) {
+            channel.close();
+        }
+    }
+
+    private boolean isLiveOrConnecting(WsConnectionContext context) {
+        return context != null && isCurrent(context) && !context.handler.isShuttingDown();
+    }
+
+    private boolean isConnected(WsConnectionContext context) {
+        if (!isCurrent(context) || !context.handshakeComplete || context.handler.isShuttingDown()) {
+            return false;
+        }
+        ChannelFuture channelFuture = context.channelFuture;
+        return channelFuture != null
+                && !channelFuture.isCancelled()
+                && channelFuture.channel() != null
+                && channelFuture.channel().isActive();
+    }
+
+    private boolean isCurrent(WsConnectionContext context) {
+        return context != null && !destroyed && context == wsContext;
+    }
+
+    private void clearCurrentContextLocked(WsConnectionContext context) {
+        if (context != null && wsContext != context) {
+            return;
+        }
+        wsContext = null;
+        wsHandler = null;
+        wsFuture = null;
+    }
+
+    private void cancelFuture(ScheduledFuture<?> future) {
+        if (future != null && !future.isDone()) {
+            future.cancel(false);
+        }
+    }
+
+    private boolean isInEventLoop(EventLoopGroup eventLoopGroup) {
+        if (eventLoopGroup == null) {
+            return false;
+        }
+        for (io.netty.util.concurrent.EventExecutor executor : eventLoopGroup) {
+            if (executor.inEventLoop()) {
+                return true;
+            }
+        }
+        return false;
     }
 }
